@@ -2,3 +2,10 @@ original/
 predicted/
 evaluator.*
 .ipynb_checkpoints/*
+
+data/*
+*.zip
+*.pkl
+*.hdf5
+*.csv
+
