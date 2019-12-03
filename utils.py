@@ -171,12 +171,23 @@ class BertForBinaryClassification(BertPreTrainedModel):
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
+        self.debug = True
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None):
         outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
                             attention_mask=attention_mask, head_mask=head_mask)
         pooled_output = outputs[1]
+        
+        # debug
+        if self.debug:
+            import pickle
+            with open("pooled_output.pkl", "wb") as f:
+                pickle.dump(outputs, f)
+                pickle.dump(token_type_ids, f)
+                pickle.dump(input_ids, f)
+                pickle.dump(labels, f)
+            self.debug = False
 
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
@@ -190,6 +201,64 @@ class BertForBinaryClassification(BertPreTrainedModel):
 
         return outputs  # (loss), logits, (hidden_states), (attentions)
 
+    
+class BertForSiameseClassification(BertPreTrainedModel):
+    def __init__(self, config):
+        super(BertForSiameseClassification, self).__init__(config)
+        self.num_labels = config.num_labels
+        # print(config)
+        self.bert = BertModel(config)
+        self.nd = config.hidden_size
+        self.encoder = nn.Sequential(
+            nn.Linear(self.nd, self.nd),
+            nn.Tanh(),
+            nn.Dropout(config.hidden_dropout_prob)
+        )
+        self.init_weights()
+        
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, head_mask=None):
+        outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
+                            attention_mask=attention_mask, head_mask=head_mask)
+        
+        # select along token_type_ids
+        # [CLS] seq_a [SEP] seq_b
+        # avg(seq_a), avg(seq_b)
+        # dropout(tanh(linear(a))), dropout(tanh(linear(b)))
+        # cosine loss (y = 1 or -1) | sigmoid loss (y = 0 or 1)
+        
+        last_hidden_state = outputs[0]
+        bs = list(last_hidden_state.size())[0]
+        
+        selection_left = input_ids.bool() * ~token_type_ids.bool()
+        selection_left[:,0] = False # do not use CLS token
+        selection_right = input_ids.bool() * token_type_ids.bool()
+        
+        mean_left = torch.zeros((bs, self.nd), device="cuda")
+        mean_right = torch.zeros((bs, self.nd), device="cuda")
+        target_ones = torch.ones(bs, device="cuda")
+        target_minus_ones = -torch.ones(bs, device="cuda")
+        
+        for i in range(bs):
+            mean_left[i] = last_hidden_state[i][selection_left[i]].mean(axis=0)
+            mean_right[i] = last_hidden_state[i][selection_right[i]].mean(axis=0)
+            
+        emb_left = self.encoder(mean_left)
+        emb_right = self.encoder(mean_right)
+        
+        sim_fct = nn.CosineSimilarity()
+        similarities = sim_fct(emb_left, emb_right)
+        outputs = (similarities,) + outputs[2:] 
+        
+        if labels is not None:
+            loss_fct = torch.nn.CosineEmbeddingLoss()
+            # convert labels to 1 or -1
+            cosine_labels = torch.where(labels > 0, target_ones, target_minus_ones)
+            loss = loss_fct(emb_left, emb_right, cosine_labels)
+            outputs = (loss,) + outputs
+
+        return outputs  # (loss), similarities, (hidden_states), (attentions)
     
     
 def convert_example_to_feature(example_row, pad_token=0,
